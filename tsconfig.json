@@ -36,6 +36,7 @@
     "drizzle",
     "examples",
     "worker",
-    "drizzle.config.ts"
+    "drizzle.config.ts",
+    "vite.config.ts"
   ]
 }
