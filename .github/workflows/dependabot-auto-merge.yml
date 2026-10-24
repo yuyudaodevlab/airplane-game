@@ -1,0 +1,143 @@
+
+name: Dependabot Auto Review & Merge
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dependabot-review:
+    name: Review and Auto Merge
+    runs-on: ubuntu-latest
+
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      # マージ可能か判定
+      - name: Check merge conflicts
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..12}; do
+            result="$(gh pr view "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json mergeable,headRefOid,state \
+              --jq '[.mergeable, .headRefOid, .state] | @tsv')"
+
+            IFS=$'\t' read -r status sha pr_state <<< "$result"
+
+            # 更新済み・クローズ済みのPRは処理しない
+            if [[ "$sha" != "$EXPECTED_SHA" || "$pr_state" != "OPEN" ]]; then
+              echo "result=SKIP" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            case "$status" in
+              MERGEABLE|CONFLICTING)
+                echo "result=$status" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              UNKNOWN)
+                sleep 5
+                ;;
+              *)
+                echo "::error::Unexpected merge state: $status"
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "::error::Mergeability could not be determined"
+          exit 1
+
+      # コンフリクト発生時
+      - name: Handle merge conflicts
+        if: steps.check.outputs.result == 'CONFLICTING'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 既存の自動マージ予約を解除
+          auto="$(gh pr view "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json autoMergeRequest \
+            --jq '.autoMergeRequest != null')"
+
+          if [[ "$auto" == "true" ]]; then
+            gh pr merge "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --disable-auto
+          fi
+
+          # 同じコミットへの重複コメントを防止
+          marker="<!-- dependabot-conflict:${EXPECTED_SHA} -->"
+
+          comments="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[].body')"
+
+          if [[ "$comments" != *"$marker"* ]]; then
+            gh pr comment "$PR_NUMBER" \
+              --repo "$GITHUB_REPOSITORY" \
+              --body "## ⚠️ Merge Conflict Detected
+
+          Dependabot による依存関係の更新でコンフリクトが検出されました。
+
+          **現在の状態**
+          - 自動マージ：無効
+          - レビュー：Changes Requested
+          - 対応：コンフリクトの解消が必要
+
+          コンフリクトを解消してブランチを更新してください。
+
+          更新後、GitHub Actions が再度確認します。
+
+          $marker"
+          fi
+
+          # レビューを変更要求にする
+          gh pr review "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --request-changes \
+            --body "コンフリクトが検出されたため、変更を要求します。競合を解消した後に再確認してください。"
+
+      # コンフリクトがない場合
+      - name: Approve pull request
+        if: steps.check.outputs.result == 'MERGEABLE'
+        run: |
+          gh pr review "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --approve \
+            --body "Dependabot PR のマージ競合がないことを確認しました。自動承認します。"
+
+      # マージ条件を満たしたら自動マージ
+      - name: Enable auto merge
+        if: steps.check.outputs.result == 'MERGEABLE'
+        run: |
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --auto \
+            --squash \
+            --match-head-commit "$EXPECTED_SHA"
